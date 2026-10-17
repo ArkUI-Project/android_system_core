@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2015 The Android Open Source Project
+ * Copyright (C) 2026 The ArkUI Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +50,7 @@
 
 #if defined(__BIONIC__)
 #include <bionic/reserved_signals.h>
+#include <sys/klog.h>
 #endif
 
 #ifdef INIT_FULL_SOURCES
@@ -75,6 +77,64 @@ using android::base::WriteStringToFile;
 
 namespace android {
 namespace init {
+
+#if defined(INIT_FULL_SOURCES) && defined(__BIONIC__)
+static void SaveArkuiGsiBootstrapKernelLog(const std::string& service, const siginfo_t& siginfo) {
+    const std::string build_type = GetProperty("ro.build.type", "user");
+    if (service != "apexd-bootstrap" || (build_type != "userdebug" && build_type != "eng") ||
+        !GetBoolProperty("ro.arkui.gsi", false) ||
+        !GetBoolProperty("ro.gsid.image_running", false)) {
+        return;
+    }
+
+    // init already has permission to read the kernel log. Capture it before the
+    // normal reboot_on_failure path, without granting apexd any extra access.
+    constexpr int kMaxKernelLogBytes = 2 * 1024 * 1024;
+    std::string kernel_log(kMaxKernelLogBytes, '\0');
+    const int length = klogctl(KLOG_READ_ALL, kernel_log.data(), kMaxKernelLogBytes);
+    if (length < 0) {
+        PLOG(WARNING) << "Unable to capture ArkUI GSI bootstrap kernel log";
+        return;
+    }
+    kernel_log.resize(length);
+
+    unique_fd directory(open("/metadata/apex", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (!directory.ok()) return;
+    unique_fd fd(openat(directory.get(), "arkui-gsi-kernel.log",
+                        O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600));
+    if (!fd.ok()) return;
+    struct stat info {};
+    if (fstat(fd.get(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != 0 ||
+        info.st_nlink != 1 || fchmod(fd.get(), 0600) != 0 || ftruncate(fd.get(), 0) != 0) {
+        return;
+    }
+
+    std::string report = StringPrintf("ArkUI GSI bootstrap failure: service=%s code=%d status=%d\n",
+                                      service.c_str(), siginfo.si_code, siginfo.si_status);
+    report += "build=" + GetProperty("ro.build.display.id", "unknown") + "\n";
+    for (const char* path : {"/dev", "/dev/loop-control", "/dev/block/loop0"}) {
+        if (stat(path, &info) == 0) {
+            report += StringPrintf("%s: mode=%#o uid=%u gid=%u", path,
+                                   static_cast<unsigned int>(info.st_mode),
+                                   static_cast<unsigned int>(info.st_uid),
+                                   static_cast<unsigned int>(info.st_gid));
+        } else {
+            report += StringPrintf("%s: stat errno=%d", path, errno);
+        }
+        char* context = nullptr;
+        if (getfilecon(path, &context) >= 0) {
+            report += " context=" + std::string(context);
+            freecon(context);
+        }
+        report += "\n";
+    }
+    report += "\nKernel log (read without clearing):\n";
+    report += kernel_log;
+    if (!android::base::WriteStringToFd(report, fd.get()) || fsync(fd.get()) != 0) {
+        PLOG(WARNING) << "Unable to save ArkUI GSI bootstrap kernel log";
+    }
+}
+#endif
 
 static Result<std::string> ComputeContextFromExecutable(const std::string& service_path) {
     std::string computed_context;
@@ -289,6 +349,9 @@ void Service::Reap(const siginfo_t& siginfo) {
     }
 
     if ((siginfo.si_code != CLD_EXITED || siginfo.si_status != 0) && on_failure_reboot_target_) {
+#if defined(INIT_FULL_SOURCES) && defined(__BIONIC__)
+        SaveArkuiGsiBootstrapKernelLog(name_, siginfo);
+#endif
         LOG(ERROR) << "Service " << name_
                    << " has 'reboot_on_failure' option and failed, shutting down system.";
         trigger_shutdown(*on_failure_reboot_target_);

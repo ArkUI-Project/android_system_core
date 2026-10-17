@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2017 The Android Open Source Project
+ * Copyright (C) 2026 The ArkUI Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,7 +69,6 @@
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <android/avf_cc_flags.h>
-#include <com_android_apex_flags.h>
 #include <fs_avb/fs_avb.h>
 #include <fs_mgr.h>
 #include <fs_mgr_overlayfs.h>
@@ -485,9 +485,10 @@ void SelinuxRestoreContext() {
     selinux_android_restorecon("/dev/dm-user", SELINUX_ANDROID_RESTORECON_RECURSE);
     selinux_android_restorecon("/dev/device-mapper", 0);
 
-    if constexpr (com::android::apex::flags::mount_before_data()) {
-        selinux_android_restorecon("/dev/loop-control", 0);
-    }
+    // The host's first-stage init may create this node before handing off to a
+    // GSI with different APEX flags. Always label an existing node according to
+    // the loaded policy before starting ueventd and apexd.
+    RestoreconIfExists("/dev/loop-control", 0);
 
     selinux_android_restorecon("/apex", 0);
     selinux_android_restorecon("/bootstrap-apex", 0);
